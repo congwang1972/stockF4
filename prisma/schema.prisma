@@ -1,0 +1,43 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Report {
+  id            String   @id @default(uuid())
+  ticker        String
+  market        String
+  companyName   String?
+  status        String
+  content       Json?
+  dataSources   Json?
+  shareToken    String?  @unique
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+  isDeleted     Boolean  @default(false) @map("is_deleted")
+
+  histories AnalysisHistory[]
+
+  @@index([ticker])
+  @@index([shareToken])
+  @@map("reports")
+}
+
+model AnalysisHistory {
+  id        String   @id @default(uuid())
+  reportId  String   @map("report_id")
+  userId    String   @map("user_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  isDeleted Boolean  @default(false) @map("is_deleted")
+
+  report Report @relation(fields: [reportId], references: [id])
+
+  @@index([userId])
+  @@index([reportId])
+  @@map("analysis_history")
+}
