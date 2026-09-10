@@ -7,13 +7,14 @@ export interface ParsedTicker {
 
 export function parseTicker(input: string): ParsedTicker {
   const normalized = input.trim().toUpperCase();
+  const cnMatch = normalized.match(/^(\d{6})(?:\.(SH|SZ))?$/);
 
-  if (/^\d{6}$/.test(normalized)) {
-    return { ticker: normalized, market: "CN" };
+  if (cnMatch) {
+    return { ticker: cnMatch[1], market: "CN" };
   }
 
-  if (/^\d{4,5}(\.HK)?$/i.test(normalized)) {
-    const ticker = normalized.replace(/\.HK$/i, "");
+  if (/^\d{4,5}(\.HK)?$/.test(normalized)) {
+    const ticker = normalized.replace(/\.HK$/, "");
     return { ticker, market: "HK" };
   }
 

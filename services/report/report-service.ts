@@ -23,7 +23,8 @@ export async function createReport(input: {
 export async function updateReportContent(
   id: string,
   content: Report["content"],
-  dataSources: string[]
+  dataSources: string[],
+  companyName: string
 ): Promise<Report> {
   const report = await prisma.report.update({
     where: { id },
@@ -31,7 +32,17 @@ export async function updateReportContent(
       status: "completed",
       content: (content as unknown as Prisma.InputJsonValue) ?? undefined,
       dataSources: dataSources,
+      companyName,
     },
+  });
+
+  return mapReport(report);
+}
+
+export async function markReportAsFailed(id: string): Promise<Report> {
+  const report = await prisma.report.update({
+    where: { id },
+    data: { status: "failed" },
   });
 
   return mapReport(report);

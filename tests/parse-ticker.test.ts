@@ -29,4 +29,11 @@ describe("parseTicker", () => {
     const result = parseTicker("@@@");
     expect(result.market).toBe("UNKNOWN");
   });
+
+  it.each([
+    ["600519.SH", "600519"],
+    ["000001.SZ", "000001"],
+  ])("should parse %s as a CN ticker", (input, ticker) => {
+    expect(parseTicker(input)).toEqual({ ticker, market: "CN" });
+  });
 });
