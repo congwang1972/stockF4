@@ -63,164 +63,142 @@ function dataNotAvailable(): ExternalServiceError {
   return new ExternalServiceError("DATA_NOT_AVAILABLE", "未获取到可用的财务数据");
 }
 
-function yahooValue(value: unknown): unknown {
-  if (isJsonObject(value) && "raw" in value) return value.raw;
-  if (isJsonObject(value) && "fmt" in value) return value.fmt;
-  return value;
-}
+function toEastMoneySecId(ticker: string, market: Market): string {
+  const clean = ticker.replace(/\.(SH|SZ|SS|HK)$/i, "");
 
-function yahooNumber(value: unknown): number | null {
-  return numberOrNull(yahooValue(value));
-}
-
-function yahooString(value: unknown): string | null {
-  const raw = yahooValue(value);
-  return stringOrNull(raw);
-}
-
-function toYahooSymbol(ticker: string, market: Market): string {
-  if (market === "US") return ticker;
+  if (market === "US") {
+    return `105.${clean}`;
+  }
   if (market === "HK") {
-    const clean = ticker.replace(/\.HK$/i, "");
-    return `${clean.padStart(4, "0")}.HK`;
+    return `116.${clean.padStart(5, "0")}`;
   }
   if (market === "CN") {
-    const clean = ticker.replace(/\.(SH|SZ)$/i, "");
-    return ticker.startsWith("6") ? `${clean}.SS` : `${clean}.SZ`;
+    return clean.startsWith("6") ? `1.${clean}` : `0.${clean}`;
   }
-  return ticker;
+  return `1.${clean}`;
 }
 
-function roundedPercentage(current: number, previous: number): number {
-  if (previous === 0) return 0;
-  return Math.round((((current - previous) / Math.abs(previous)) * 100 + Number.EPSILON) * 100) / 100;
+function toEastMoneyCode(ticker: string, market: Market): string {
+  const clean = ticker.replace(/\.(SH|SZ|SS|HK)$/i, "");
+  if (market === "US") return clean;
+  if (market === "HK") return clean.padStart(5, "0");
+  return clean;
 }
 
-const YAHOO_HEADERS = {
+const EASTMONEY_HEADERS = {
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  "Accept": "application/json",
+  "Accept": "application/json, text/plain, */*",
+  "Referer": "https://quote.eastmoney.com/",
 };
 
-async function yahooQuoteSummary(symbol: string, modules: string[]): Promise<JsonObject> {
-  const params = new URLSearchParams({ modules: modules.join(",") });
-  const url = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${symbol}?${params}`;
+async function eastMoneyStockGet(secid: string): Promise<JsonObject> {
+  const fields = "f43,f44,f45,f46,f47,f48,f50,f57,f58,f84,f85,f116,f117,f162,f167,f168,f169,f170,f171,f172,f173,f183,f184,f185,f186,f187,f188,f189,f190,f191,f192";
+  const url = `https://push2.eastmoney.com/api/qt/stock/get?secid=${secid}&fields=${fields}&fltt=2&invt=2`;
 
   try {
     const response = await fetch(url, {
-      headers: YAHOO_HEADERS,
-      signal: AbortSignal.timeout(15_000),
+      headers: EASTMONEY_HEADERS,
+      signal: AbortSignal.timeout(10_000),
     });
 
     if (!response.ok) {
-      throw unavailable(`Yahoo Finance 返回 ${response.status}`);
+      throw unavailable(`东方财富返回 ${response.status}`);
     }
 
     const payload: unknown = await response.json();
-    if (!isJsonObject(payload)) throw unavailable("Yahoo Finance 响应格式错误");
+    if (!isJsonObject(payload)) throw unavailable("东方财富响应格式错误");
 
-    const quoteSummary = payload.quoteSummary;
-    if (!isJsonObject(quoteSummary)) throw unavailable("Yahoo Finance 响应格式错误");
+    const data = payload.data;
+    if (!isJsonObject(data)) throw dataNotAvailable();
 
-    const result = quoteSummary.result;
-    if (!isUnknownArray(result) || result.length === 0) {
-      throw dataNotAvailable();
-    }
-
-    const first = result[0];
-    if (!isJsonObject(first)) throw dataNotAvailable();
-
-    return first;
+    return data;
   } catch (error) {
     if (error instanceof ExternalServiceError) throw error;
-    throw unavailable("Yahoo Finance 服务暂不可用");
+    throw unavailable("东方财富服务暂不可用");
   }
 }
 
-async function yahooChart(symbol: string): Promise<StockQuote | null> {
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=1d`;
+async function eastMoneyFinancialData(code: string, market: Market): Promise<JsonObject[]> {
+  if (market !== "CN") return [];
+
+  const reportName = "RPT_LICO_FN_CPD";
+  const url = `https://datacenter.eastmoney.com/securities/api/data/v1/get?reportName=${reportName}&columns=ALL&filter=(SECURITY_CODE%3D%22${code}%22)&pageNumber=1&pageSize=5&sortTypes=-1&sortColumns=REPORT_DATE`;
 
   try {
     const response = await fetch(url, {
-      headers: YAHOO_HEADERS,
-      signal: AbortSignal.timeout(5_000),
+      headers: EASTMONEY_HEADERS,
+      signal: AbortSignal.timeout(10_000),
     });
 
-    if (!response.ok) return null;
+    if (!response.ok) return [];
 
     const payload: unknown = await response.json();
-    if (!isJsonObject(payload)) return null;
+    if (!isJsonObject(payload)) return [];
 
-    const chart = payload.chart;
-    if (!isJsonObject(chart)) return null;
+    const result = payload.result;
+    if (!isJsonObject(result)) return [];
 
-    const result = chart.result;
-    if (!isUnknownArray(result) || result.length === 0) return null;
+    const data = result.data;
+    if (!isUnknownArray(data)) return [];
 
-    const first = result[0];
-    if (!isJsonObject(first)) return null;
-
-    const meta = first.meta;
-    if (!isJsonObject(meta)) return null;
-
-    const price = yahooNumber(meta.regularMarketPrice);
-    const currency = yahooString(meta.currency);
-
-    if (price === null) return null;
-
-    const currencyMap: Record<string, "CNY" | "USD" | "HKD"> = {
-      CNY: "CNY",
-      USD: "USD",
-      HKD: "HKD",
-    };
-
-    return {
-      price,
-      currency: currencyMap[currency ?? "USD"] ?? "USD",
-      updatedAt: new Date().toISOString(),
-    };
+    return data.filter(isJsonObject);
   } catch {
-    return null;
+    return [];
   }
 }
 
-function extractIncomeStatements(data: JsonObject): JsonObject[] {
-  const history = data.incomeStatementHistory;
-  if (!isJsonObject(history)) return [];
-  const statements = history.incomeStatementHistory;
-  if (!isUnknownArray(statements)) return [];
-  return statements.filter(isJsonObject);
+async function eastMoneyIncomeStatement(code: string, market: Market): Promise<JsonObject[]> {
+  if (market !== "CN") return [];
+
+  const url = `https://datacenter.eastmoney.com/securities/api/data/v1/get?reportName=RPT_DMSK_FN_INCOME&columns=ALL&filter=(SECURITY_CODE%3D%22${code}%22)&pageNumber=1&pageSize=5&sortTypes=-1&sortColumns=REPORT_DATE`;
+
+  try {
+    const response = await fetch(url, {
+      headers: EASTMONEY_HEADERS,
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    if (!response.ok) return [];
+
+    const payload: unknown = await response.json();
+    if (!isJsonObject(payload)) return [];
+
+    const result = payload.result;
+    if (!isJsonObject(result)) return [];
+
+    const data = result.data;
+    if (!isUnknownArray(data)) return [];
+
+    return data.filter(isJsonObject);
+  } catch {
+    return [];
+  }
 }
 
-function extractBalanceSheets(data: JsonObject): JsonObject[] {
-  const history = data.balanceSheetHistory;
-  if (!isJsonObject(history)) return [];
-  const statements = history.balanceSheetStatements;
-  if (!isUnknownArray(statements)) return [];
-  return statements.filter(isJsonObject);
-}
-
-function extractCashFlowStatements(data: JsonObject): JsonObject[] {
-  const history = data.cashflowStatementHistory;
-  if (!isJsonObject(history)) return [];
-  const statements = history.cashflowStatements;
-  if (!isUnknownArray(statements)) return [];
-  return statements.filter(isJsonObject);
-}
-
-function buildMetricsFromYahoo(data: JsonObject): FinancialMetrics {
-  const incomeStatements = extractIncomeStatements(data);
-  const balanceSheets = extractBalanceSheets(data);
-  const cashFlowStatements = extractCashFlowStatements(data);
+function buildMetricsFromEastMoney(
+  stockData: JsonObject,
+  financialData: JsonObject[],
+  incomeData: JsonObject[]
+): FinancialMetrics {
+  const peRatio = numberOrNull(stockData.f162);
+  const roe = numberOrNull(stockData.f167);
+  const profitMargin = numberOrNull(stockData.f186);
 
   const revenueGrowth: number[] = [];
   const netIncome: number[] = [];
   const freeCashFlow: number[] = [];
 
+  const sortedIncome = [...incomeData].sort((a, b) => {
+    const dateA = stringOrNull(a.REPORT_DATE) ?? "";
+    const dateB = stringOrNull(b.REPORT_DATE) ?? "";
+    return dateA.localeCompare(dateB);
+  });
+
   const revenues: (number | null)[] = [];
-  for (const stmt of incomeStatements.slice(-5)) {
-    const revenue = yahooNumber(stmt.totalRevenue);
+  for (const stmt of sortedIncome.slice(-5)) {
+    const revenue = numberOrNull(stmt.TOTAL_OPERATE_INCOME);
     revenues.push(revenue);
-    const net = yahooNumber(stmt.netIncome);
+    const net = numberOrNull(stmt.NETPROFIT);
     if (net !== null) netIncome.push(net);
   }
 
@@ -228,91 +206,89 @@ function buildMetricsFromYahoo(data: JsonObject): FinancialMetrics {
     const current = revenues[i];
     const previous = revenues[i - 1];
     if (current !== null && previous !== null && previous !== 0) {
-      revenueGrowth.push(roundedPercentage(current, previous));
+      revenueGrowth.push(Math.round((((current - previous) / Math.abs(previous)) * 100 + Number.EPSILON) * 100) / 100);
     }
   }
 
-  const cashFlowByDate = new Map<string, JsonObject>();
-  for (const stmt of cashFlowStatements) {
-    const endDate = yahooString(stmt.endDate);
-    if (endDate !== null) cashFlowByDate.set(endDate, stmt);
-  }
-
-  for (const stmt of incomeStatements.slice(-5)) {
-    const endDate = yahooString(stmt.endDate);
-    if (endDate === null) continue;
-    const cashStmt = cashFlowByDate.get(endDate);
-    if (cashStmt === undefined) continue;
-    const operating = yahooNumber(cashStmt.totalCashFromOperatingActivities);
-    const capex = yahooNumber(cashStmt.capitalExpenditures);
-    if (operating !== null && capex !== null) {
-      freeCashFlow.push(operating - Math.abs(capex));
+  for (const stmt of sortedIncome.slice(-5)) {
+    const operating = numberOrNull(stmt.NETCASH_OPERATE);
+    const capex = numberOrNull(stmt.BUY_FINANCE_PRODUCT);
+    if (operating !== null) {
+      freeCashFlow.push(capex !== null ? operating - Math.abs(capex) : operating);
     }
   }
 
-  const financialData = isJsonObject(data.financialData) ? data.financialData : {};
-  const keyStats = isJsonObject(data.defaultKeyStatistics) ? data.defaultKeyStatistics : {};
-
-  const profitMargin = yahooNumber(financialData.profitMargins);
-  const roe = yahooNumber(financialData.returnOnEquity);
-  const peRatio = yahooNumber(keyStats.trailingPE) ?? yahooNumber(financialData.trailingPE);
-
-  const latestBalance = balanceSheets[balanceSheets.length - 1];
-  const assets = latestBalance === undefined ? null : yahooNumber(latestBalance.totalAssets);
-  const liabilities = latestBalance === undefined ? null : yahooNumber(latestBalance.totalLiab);
+  const totalAssets = numberOrNull(stockData.f183);
+  const totalLiabilities = numberOrNull(stockData.f184);
+  const debtLevel = totalAssets !== null && totalLiabilities !== null && totalAssets !== 0
+    ? totalLiabilities / totalAssets
+    : null;
 
   return {
     revenueGrowth,
     netIncome,
     freeCashFlow,
-    profitMargin,
-    debtLevel: assets === null || liabilities === null || assets === 0 ? null : liabilities / assets,
-    roe,
+    profitMargin: profitMargin !== null ? profitMargin / 100 : null,
+    debtLevel,
+    roe: roe !== null ? roe / 100 : null,
     peRatio,
     industryAvgPe: null,
   };
 }
 
-function extractProfile(data: JsonObject): CompanyProfile {
-  const profile = isJsonObject(data.summaryProfile) ? data.summaryProfile : {};
-  const price = isJsonObject(data.price) ? data.price : {};
-
-  const name = yahooString(price.longName) ?? yahooString(price.shortName) ?? yahooString(profile.companyName);
+function extractProfile(stockData: JsonObject, market: Market): CompanyProfile {
+  const name = stringOrNull(stockData.f58);
   if (name === null) throw dataNotAvailable();
+
+  let sector: string | null = null;
+  if (market === "CN") {
+    sector = stringOrNull(stockData.f127);
+  }
 
   return {
     name,
-    sector: yahooString(profile.sector),
-    description: yahooString(profile.longBusinessSummary),
+    sector,
+    description: null,
   };
 }
 
-async function fetchFinancialDataFromYahoo(
+function extractQuote(stockData: JsonObject, market: Market): StockQuote | null {
+  const price = numberOrNull(stockData.f43);
+  if (price === null) return null;
+
+  const currencyMap: Record<Market, "CNY" | "USD" | "HKD"> = {
+    CN: "CNY",
+    US: "USD",
+    HK: "HKD",
+    UNKNOWN: "CNY",
+  };
+
+  return {
+    price,
+    currency: currencyMap[market],
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+async function fetchFinancialDataFromEastMoney(
   ticker: string,
   market: SupportedMarket
 ): Promise<FinancialData> {
-  const symbol = toYahooSymbol(ticker, market);
+  const secid = toEastMoneySecId(ticker, market);
+  const code = toEastMoneyCode(ticker, market);
 
-  const modules = [
-    "summaryProfile",
-    "financialData",
-    "defaultKeyStatistics",
-    "incomeStatementHistory",
-    "balanceSheetHistory",
-    "cashflowStatementHistory",
-    "price",
-  ];
-
-  const [summaryData, quote] = await Promise.all([
-    yahooQuoteSummary(symbol, modules),
-    yahooChart(symbol),
+  const [stockData, financialData, incomeData] = await Promise.all([
+    eastMoneyStockGet(secid),
+    eastMoneyFinancialData(code, market),
+    eastMoneyIncomeStatement(code, market),
   ]);
 
-  const profile = extractProfile(summaryData);
-  const metrics = buildMetricsFromYahoo(summaryData);
+  const profile = extractProfile(stockData, market);
+  const metrics = buildMetricsFromEastMoney(stockData, financialData, incomeData);
+  const quote = extractQuote(stockData, market);
 
-  const sources = ["yahoo-finance:fundamentals"];
-  if (quote !== null) sources.push("yahoo-finance:quote");
+  const sources = ["eastmoney:stock"];
+  if (incomeData.length > 0) sources.push("eastmoney:financials");
 
   return { profile, metrics, quote, sources };
 }
@@ -321,7 +297,7 @@ export async function fetchFinancialData(
   ticker: string,
   market: Exclude<Market, "UNKNOWN">
 ): Promise<FinancialData> {
-  return fetchFinancialDataFromYahoo(ticker, market);
+  return fetchFinancialDataFromEastMoney(ticker, market);
 }
 
 function supportedMarket(market: Market): SupportedMarket {
