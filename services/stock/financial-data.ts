@@ -20,7 +20,7 @@ export interface CompanyProfile {
 
 export interface StockQuote {
   price: number;
-  currency: "CNY" | "USD";
+  currency: "CNY" | "USD" | "HKD";
   updatedAt: string;
 }
 
@@ -34,30 +34,12 @@ export interface FinancialData {
 type JsonObject = Record<string, unknown>;
 type SupportedMarket = Exclude<Market, "UNKNOWN">;
 
-type DatedRecord = {
-  date: string;
-  values: JsonObject;
-};
-
-type MetricFields = {
-  revenue: string;
-  netIncome: string;
-  operatingCashflow: string;
-  capitalExpenditures: string;
-  totalAssets: string;
-  totalLiabilities: string;
-};
-
 function isJsonObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function isUnknownArray(value: unknown): value is unknown[] {
   return Array.isArray(value);
-}
-
-function isStringArray(value: unknown): value is string[] {
-  return isUnknownArray(value) && value.every((item) => typeof item === "string");
 }
 
 function numberOrNull(value: unknown): number | null {
@@ -81,94 +63,203 @@ function dataNotAvailable(): ExternalServiceError {
   return new ExternalServiceError("DATA_NOT_AVAILABLE", "未获取到可用的财务数据");
 }
 
-function datedRecords(rows: JsonObject[], dateField: string): DatedRecord[] {
-  const records: DatedRecord[] = [];
-  for (const values of rows) {
-    const date = stringOrNull(values[dateField]);
-    if (date !== null) records.push({ date, values });
+function yahooValue(value: unknown): unknown {
+  if (isJsonObject(value) && "raw" in value) return value.raw;
+  if (isJsonObject(value) && "fmt" in value) return value.fmt;
+  return value;
+}
+
+function yahooNumber(value: unknown): number | null {
+  return numberOrNull(yahooValue(value));
+}
+
+function yahooString(value: unknown): string | null {
+  const raw = yahooValue(value);
+  return stringOrNull(raw);
+}
+
+function toYahooSymbol(ticker: string, market: Market): string {
+  if (market === "US") return ticker;
+  if (market === "HK") {
+    const clean = ticker.replace(/\.HK$/i, "");
+    return `${clean.padStart(4, "0")}.HK`;
   }
-  return records.sort((left, right) => left.date.localeCompare(right.date));
-}
-
-function annualDatedRecords(rows: JsonObject[], dateField: string): DatedRecord[] {
-  return datedRecords(rows, dateField).filter((record) => record.date.replace(/\D/g, "").endsWith("1231"));
-}
-
-function percentageToRatio(value: number | null): number | null {
-  return value === null ? null : value / 100;
-}
-
-function alphaAnnualRecords(payload: JsonObject): DatedRecord[] {
-  const reports = payload.annualReports;
-  if (!isUnknownArray(reports)) throw unavailable("美股数据服务暂不可用");
-  return datedRecords(reports.filter(isJsonObject), "fiscalDateEnding");
-}
-
-function latestNumber(records: DatedRecord[], field: string): number | null {
-  for (let index = records.length - 1; index >= 0; index -= 1) {
-    const record = records[index];
-    if (record === undefined) continue;
-    const value = numberOrNull(record.values[field]);
-    if (value !== null) return value;
+  if (market === "CN") {
+    const clean = ticker.replace(/\.(SH|SZ)$/i, "");
+    return ticker.startsWith("6") ? `${clean}.SS` : `${clean}.SZ`;
   }
-  return null;
+  return ticker;
 }
 
 function roundedPercentage(current: number, previous: number): number {
+  if (previous === 0) return 0;
   return Math.round((((current - previous) / Math.abs(previous)) * 100 + Number.EPSILON) * 100) / 100;
 }
 
-function buildMetrics(
-  income: DatedRecord[],
-  cashFlow: DatedRecord[],
-  balanceSheet: DatedRecord[],
-  fields: MetricFields,
-  profitMargin: number | null,
-  roe: number | null,
-  peRatio: number | null
-): FinancialMetrics {
-  const lastFive = income.slice(-5);
-  if (lastFive.length === 0) throw dataNotAvailable();
+const YAHOO_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "Accept": "application/json",
+};
+
+async function yahooQuoteSummary(symbol: string, modules: string[]): Promise<JsonObject> {
+  const params = new URLSearchParams({ modules: modules.join(",") });
+  const url = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${symbol}?${params}`;
+
+  try {
+    const response = await fetch(url, {
+      headers: YAHOO_HEADERS,
+      signal: AbortSignal.timeout(15_000),
+    });
+
+    if (!response.ok) {
+      throw unavailable(`Yahoo Finance 返回 ${response.status}`);
+    }
+
+    const payload: unknown = await response.json();
+    if (!isJsonObject(payload)) throw unavailable("Yahoo Finance 响应格式错误");
+
+    const quoteSummary = payload.quoteSummary;
+    if (!isJsonObject(quoteSummary)) throw unavailable("Yahoo Finance 响应格式错误");
+
+    const result = quoteSummary.result;
+    if (!isUnknownArray(result) || result.length === 0) {
+      throw dataNotAvailable();
+    }
+
+    const first = result[0];
+    if (!isJsonObject(first)) throw dataNotAvailable();
+
+    return first;
+  } catch (error) {
+    if (error instanceof ExternalServiceError) throw error;
+    throw unavailable("Yahoo Finance 服务暂不可用");
+  }
+}
+
+async function yahooChart(symbol: string): Promise<StockQuote | null> {
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=1d`;
+
+  try {
+    const response = await fetch(url, {
+      headers: YAHOO_HEADERS,
+      signal: AbortSignal.timeout(5_000),
+    });
+
+    if (!response.ok) return null;
+
+    const payload: unknown = await response.json();
+    if (!isJsonObject(payload)) return null;
+
+    const chart = payload.chart;
+    if (!isJsonObject(chart)) return null;
+
+    const result = chart.result;
+    if (!isUnknownArray(result) || result.length === 0) return null;
+
+    const first = result[0];
+    if (!isJsonObject(first)) return null;
+
+    const meta = first.meta;
+    if (!isJsonObject(meta)) return null;
+
+    const price = yahooNumber(meta.regularMarketPrice);
+    const currency = yahooString(meta.currency);
+
+    if (price === null) return null;
+
+    const currencyMap: Record<string, "CNY" | "USD" | "HKD"> = {
+      CNY: "CNY",
+      USD: "USD",
+      HKD: "HKD",
+    };
+
+    return {
+      price,
+      currency: currencyMap[currency ?? "USD"] ?? "USD",
+      updatedAt: new Date().toISOString(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function extractIncomeStatements(data: JsonObject): JsonObject[] {
+  const history = data.incomeStatementHistory;
+  if (!isJsonObject(history)) return [];
+  const statements = history.incomeStatementHistory;
+  if (!isUnknownArray(statements)) return [];
+  return statements.filter(isJsonObject);
+}
+
+function extractBalanceSheets(data: JsonObject): JsonObject[] {
+  const history = data.balanceSheetHistory;
+  if (!isJsonObject(history)) return [];
+  const statements = history.balanceSheetStatements;
+  if (!isUnknownArray(statements)) return [];
+  return statements.filter(isJsonObject);
+}
+
+function extractCashFlowStatements(data: JsonObject): JsonObject[] {
+  const history = data.cashflowStatementHistory;
+  if (!isJsonObject(history)) return [];
+  const statements = history.cashflowStatements;
+  if (!isUnknownArray(statements)) return [];
+  return statements.filter(isJsonObject);
+}
+
+function buildMetricsFromYahoo(data: JsonObject): FinancialMetrics {
+  const incomeStatements = extractIncomeStatements(data);
+  const balanceSheets = extractBalanceSheets(data);
+  const cashFlowStatements = extractCashFlowStatements(data);
 
   const revenueGrowth: number[] = [];
   const netIncome: number[] = [];
   const freeCashFlow: number[] = [];
-  const cashFlowByDate = new Map<string, DatedRecord>();
-  for (const record of cashFlow) cashFlowByDate.set(record.date, record);
 
-  for (let index = 0; index < lastFive.length; index += 1) {
-    const record = lastFive[index];
-    if (record === undefined) continue;
-    const netIncomeValue = numberOrNull(record.values[fields.netIncome]);
-    if (netIncomeValue !== null) netIncome.push(netIncomeValue);
+  const revenues: (number | null)[] = [];
+  for (const stmt of incomeStatements.slice(-5)) {
+    const revenue = yahooNumber(stmt.totalRevenue);
+    revenues.push(revenue);
+    const net = yahooNumber(stmt.netIncome);
+    if (net !== null) netIncome.push(net);
+  }
 
-    const cashRecord = cashFlowByDate.get(record.date);
-    const operatingCashflow = cashRecord === undefined
-      ? null
-      : numberOrNull(cashRecord.values[fields.operatingCashflow]);
-    const capitalExpenditures = cashRecord === undefined
-      ? null
-      : numberOrNull(cashRecord.values[fields.capitalExpenditures]);
-    if (operatingCashflow !== null && capitalExpenditures !== null) {
-      freeCashFlow.push(operatingCashflow - Math.abs(capitalExpenditures));
-    }
-
-    const previous = lastFive[index - 1];
-    if (previous === undefined) continue;
-    const currentRevenue = numberOrNull(record.values[fields.revenue]);
-    const previousRevenue = numberOrNull(previous.values[fields.revenue]);
-    if (currentRevenue !== null && previousRevenue !== null && previousRevenue !== 0) {
-      revenueGrowth.push(roundedPercentage(currentRevenue, previousRevenue));
+  for (let i = 1; i < revenues.length; i++) {
+    const current = revenues[i];
+    const previous = revenues[i - 1];
+    if (current !== null && previous !== null && previous !== 0) {
+      revenueGrowth.push(roundedPercentage(current, previous));
     }
   }
 
-  const latestBalance = balanceSheet[balanceSheet.length - 1];
-  const assets = latestBalance === undefined
-    ? null
-    : numberOrNull(latestBalance.values[fields.totalAssets]);
-  const liabilities = latestBalance === undefined
-    ? null
-    : numberOrNull(latestBalance.values[fields.totalLiabilities]);
+  const cashFlowByDate = new Map<string, JsonObject>();
+  for (const stmt of cashFlowStatements) {
+    const endDate = yahooString(stmt.endDate);
+    if (endDate !== null) cashFlowByDate.set(endDate, stmt);
+  }
+
+  for (const stmt of incomeStatements.slice(-5)) {
+    const endDate = yahooString(stmt.endDate);
+    if (endDate === null) continue;
+    const cashStmt = cashFlowByDate.get(endDate);
+    if (cashStmt === undefined) continue;
+    const operating = yahooNumber(cashStmt.totalCashFromOperatingActivities);
+    const capex = yahooNumber(cashStmt.capitalExpenditures);
+    if (operating !== null && capex !== null) {
+      freeCashFlow.push(operating - Math.abs(capex));
+    }
+  }
+
+  const financialData = isJsonObject(data.financialData) ? data.financialData : {};
+  const keyStats = isJsonObject(data.defaultKeyStatistics) ? data.defaultKeyStatistics : {};
+
+  const profitMargin = yahooNumber(financialData.profitMargins);
+  const roe = yahooNumber(financialData.returnOnEquity);
+  const peRatio = yahooNumber(keyStats.trailingPE) ?? yahooNumber(financialData.trailingPE);
+
+  const latestBalance = balanceSheets[balanceSheets.length - 1];
+  const assets = latestBalance === undefined ? null : yahooNumber(latestBalance.totalAssets);
+  const liabilities = latestBalance === undefined ? null : yahooNumber(latestBalance.totalLiab);
 
   return {
     revenueGrowth,
@@ -182,203 +273,55 @@ function buildMetrics(
   };
 }
 
-async function alphaVantageRequest(
-  functionName: string,
-  ticker: string,
-  apiKey: string
-): Promise<JsonObject> {
-  const parameters = new URLSearchParams({
-    function: functionName,
-    symbol: ticker,
-    apikey: apiKey,
-  });
-  try {
-    const response = await fetch(
-      `https://www.alphavantage.co/query?${parameters.toString()}`,
-      { signal: AbortSignal.timeout(10_000) }
-    );
-    if (!response.ok) throw unavailable("美股数据服务暂不可用");
-    const payload: unknown = await response.json();
-    if (
-      !isJsonObject(payload) ||
-      "Note" in payload ||
-      "Information" in payload ||
-      "Error Message" in payload
-    ) {
-      throw unavailable("美股数据服务暂不可用");
-    }
-    return payload;
-  } catch (error) {
-    if (error instanceof ExternalServiceError) throw error;
-    throw unavailable("美股数据服务暂不可用");
-  }
-}
+function extractProfile(data: JsonObject): CompanyProfile {
+  const profile = isJsonObject(data.summaryProfile) ? data.summaryProfile : {};
+  const price = isJsonObject(data.price) ? data.price : {};
 
-async function fetchTencentQuote(
-  ticker: string,
-  market: "US" | "CN"
-): Promise<StockQuote | null> {
-  const symbol = market === "US"
-    ? `us${ticker}`
-    : ticker.startsWith("6") ? `sh${ticker}` : `sz${ticker}`;
-  try {
-    const response = await fetch(`https://qt.gtimg.cn/q=${symbol}`, {
-      signal: AbortSignal.timeout(3_000),
-    });
-    if (!response.ok) return null;
-    const text = await response.text();
-    const match = text.match(/="([^"]*)"/);
-    const value = match === null ? undefined : match[1];
-    const price = value === undefined ? null : numberOrNull(value.split("~")[3]);
-    return price === null
-      ? null
-      : { price, currency: market === "US" ? "USD" : "CNY", updatedAt: new Date().toISOString() };
-  } catch {
-    return null;
-  }
-}
-
-async function fetchUsFinancialData(ticker: string): Promise<FinancialData> {
-  const apiKey = stringOrNull(process.env.ALPHA_VANTAGE_API_KEY);
-  if (apiKey === null) {
-    throw new ExternalServiceError("DATA_PROVIDER_NOT_CONFIGURED", "美股数据服务未配置");
-  }
-  const quotePromise = fetchTencentQuote(ticker, "US");
-  const [overview, income, cashFlow, balanceSheet] = await Promise.all([
-    alphaVantageRequest("OVERVIEW", ticker, apiKey),
-    alphaVantageRequest("INCOME_STATEMENT", ticker, apiKey),
-    alphaVantageRequest("CASH_FLOW", ticker, apiKey),
-    alphaVantageRequest("BALANCE_SHEET", ticker, apiKey),
-  ]);
-  const name = stringOrNull(overview.Name);
+  const name = yahooString(price.longName) ?? yahooString(price.shortName) ?? yahooString(profile.companyName);
   if (name === null) throw dataNotAvailable();
-  const metrics = buildMetrics(
-    alphaAnnualRecords(income),
-    alphaAnnualRecords(cashFlow),
-    alphaAnnualRecords(balanceSheet),
-    {
-      revenue: "totalRevenue",
-      netIncome: "netIncome",
-      operatingCashflow: "operatingCashflow",
-      capitalExpenditures: "capitalExpenditures",
-      totalAssets: "totalAssets",
-      totalLiabilities: "totalLiabilities",
-    },
-    numberOrNull(overview.ProfitMargin),
-    numberOrNull(overview.ReturnOnEquityTTM),
-    numberOrNull(overview.PERatio)
-  );
-  const quote = await Promise.race([quotePromise, Promise.resolve<StockQuote | null>(null)]);
-  const sources = ["alpha-vantage:fundamentals"];
-  if (quote !== null) sources.push("qt.gtimg.cn:quote");
+
   return {
-    profile: {
-      name,
-      sector: stringOrNull(overview.Sector),
-      description: stringOrNull(overview.Description),
-    },
-    metrics,
-    quote,
-    sources,
+    name,
+    sector: yahooString(profile.sector),
+    description: yahooString(profile.longBusinessSummary),
   };
 }
 
-async function tushareRows(
-  apiName: string,
-  token: string,
-  params: JsonObject
-): Promise<JsonObject[]> {
-  try {
-    const response = await fetch("https://api.tushare.pro", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ api_name: apiName, token, params }),
-      signal: AbortSignal.timeout(10_000),
-    });
-    if (!response.ok) throw unavailable("A股数据服务暂不可用");
-    const payload: unknown = await response.json();
-    if (!isJsonObject(payload) || numberOrNull(payload.code) !== 0 || !isJsonObject(payload.data)) {
-      throw unavailable("A股数据服务暂不可用");
-    }
-    const fields = payload.data.fields;
-    const items = payload.data.items;
-    if (!isStringArray(fields) || !isUnknownArray(items)) {
-      throw unavailable("A股数据服务暂不可用");
-    }
-    const rows: JsonObject[] = [];
-    for (const item of items) {
-      if (!isUnknownArray(item) || item.length !== fields.length) {
-        throw unavailable("A股数据服务暂不可用");
-      }
-      const row: JsonObject = {};
-      for (let index = 0; index < fields.length; index += 1) {
-        const field = fields[index];
-        if (field !== undefined) row[field] = item[index];
-      }
-      rows.push(row);
-    }
-    if (rows.length === 0) throw dataNotAvailable();
-    return rows;
-  } catch (error) {
-    if (error instanceof ExternalServiceError) throw error;
-    throw unavailable("A股数据服务暂不可用");
-  }
-}
+async function fetchFinancialDataFromYahoo(
+  ticker: string,
+  market: SupportedMarket
+): Promise<FinancialData> {
+  const symbol = toYahooSymbol(ticker, market);
 
-async function fetchCnFinancialData(ticker: string): Promise<FinancialData> {
-  const token = stringOrNull(process.env.TUSHARE_TOKEN);
-  if (token === null) {
-    throw new ExternalServiceError("DATA_PROVIDER_NOT_CONFIGURED", "A股数据服务未配置");
-  }
-  const tsCode = ticker.startsWith("6") ? `${ticker}.SH` : `${ticker}.SZ`;
-  const quotePromise = fetchTencentQuote(ticker, "CN");
-  const [stockBasic, income, cashFlow, balanceSheet, finaIndicator, dailyBasic] = await Promise.all([
-    tushareRows("stock_basic", token, { ts_code: tsCode, fields: "ts_code,name,industry" }),
-    tushareRows("income", token, { ts_code: tsCode, fields: "end_date,total_revenue,n_income" }),
-    tushareRows("cashflow", token, { ts_code: tsCode, fields: "end_date,n_cashflow_act,c_pay_acq_const_fiolta" }),
-    tushareRows("balancesheet", token, { ts_code: tsCode, fields: "end_date,total_assets,total_liab" }),
-    tushareRows("fina_indicator", token, { ts_code: tsCode, fields: "end_date,roe" }),
-    tushareRows("daily_basic", token, { ts_code: tsCode, fields: "trade_date,pe_ttm" }),
+  const modules = [
+    "summaryProfile",
+    "financialData",
+    "defaultKeyStatistics",
+    "incomeStatementHistory",
+    "balanceSheetHistory",
+    "cashflowStatementHistory",
+    "price",
+  ];
+
+  const [summaryData, quote] = await Promise.all([
+    yahooQuoteSummary(symbol, modules),
+    yahooChart(symbol),
   ]);
-  const company = stockBasic[0];
-  if (company === undefined) throw dataNotAvailable();
-  const name = stringOrNull(company.name);
-  if (name === null) throw dataNotAvailable();
-  const metrics = buildMetrics(
-    annualDatedRecords(income, "end_date"),
-    annualDatedRecords(cashFlow, "end_date"),
-    annualDatedRecords(balanceSheet, "end_date"),
-    {
-      revenue: "total_revenue",
-      netIncome: "n_income",
-      operatingCashflow: "n_cashflow_act",
-      capitalExpenditures: "c_pay_acq_const_fiolta",
-      totalAssets: "total_assets",
-      totalLiabilities: "total_liab",
-    },
-    null,
-    percentageToRatio(latestNumber(annualDatedRecords(finaIndicator, "end_date"), "roe")),
-    latestNumber(datedRecords(dailyBasic, "trade_date"), "pe_ttm")
-  );
-  const quote = await Promise.race([quotePromise, Promise.resolve<StockQuote | null>(null)]);
-  const sources = ["tushare:fundamentals"];
-  if (quote !== null) sources.push("qt.gtimg.cn:quote");
-  return {
-    profile: { name, sector: stringOrNull(company.industry), description: null },
-    metrics,
-    quote,
-    sources,
-  };
+
+  const profile = extractProfile(summaryData);
+  const metrics = buildMetricsFromYahoo(summaryData);
+
+  const sources = ["yahoo-finance:fundamentals"];
+  if (quote !== null) sources.push("yahoo-finance:quote");
+
+  return { profile, metrics, quote, sources };
 }
 
 export async function fetchFinancialData(
   ticker: string,
   market: Exclude<Market, "UNKNOWN">
 ): Promise<FinancialData> {
-  if (market === "HK") {
-    throw new ExternalServiceError("MARKET_NOT_SUPPORTED", "港股基本面数据暂未接入");
-  }
-  return market === "US" ? fetchUsFinancialData(ticker) : fetchCnFinancialData(ticker);
+  return fetchFinancialDataFromYahoo(ticker, market);
 }
 
 function supportedMarket(market: Market): SupportedMarket {
