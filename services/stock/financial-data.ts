@@ -63,6 +63,40 @@ function dataNotAvailable(): ExternalServiceError {
   return new ExternalServiceError("DATA_NOT_AVAILABLE", "未获取到可用的财务数据");
 }
 
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 1_000;
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => { setTimeout(resolve, ms); });
+}
+
+async function fetchWithRetry(
+  url: string,
+  init: RequestInit,
+  errorMessage: string
+): Promise<Response> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt += 1) {
+    try {
+      const response = await fetch(url, init);
+      if (response.ok) return response;
+      if (response.status >= 500) {
+        lastError = unavailable(`${errorMessage}（HTTP ${response.status}）`);
+        if (attempt < MAX_RETRIES - 1) await delay(RETRY_DELAY_MS);
+        continue;
+      }
+      throw unavailable(`${errorMessage}（HTTP ${response.status}）`);
+    } catch (error) {
+      if (error instanceof ExternalServiceError) throw error;
+      lastError = unavailable(errorMessage);
+      if (attempt < MAX_RETRIES - 1) await delay(RETRY_DELAY_MS);
+    }
+  }
+  throw lastError instanceof ExternalServiceError
+    ? lastError
+    : unavailable(errorMessage);
+}
+
 function toEastMoneySecId(ticker: string, market: Market): string {
   const clean = ticker.replace(/\.(SH|SZ|SS|HK)$/i, "");
 
@@ -95,27 +129,18 @@ async function eastMoneyStockGet(secid: string): Promise<JsonObject> {
   const fields = "f43,f44,f45,f46,f47,f48,f50,f57,f58,f84,f85,f116,f117,f162,f167,f168,f169,f170,f171,f172,f173,f183,f184,f185,f186,f187,f188,f189,f190,f191,f192";
   const url = `https://push2.eastmoney.com/api/qt/stock/get?secid=${secid}&fields=${fields}&fltt=2&invt=2`;
 
-  try {
-    const response = await fetch(url, {
-      headers: EASTMONEY_HEADERS,
-      signal: AbortSignal.timeout(10_000),
-    });
+  const response = await fetchWithRetry(url, {
+    headers: EASTMONEY_HEADERS,
+    signal: AbortSignal.timeout(10_000),
+  }, "东方财富行情服务暂不可用");
 
-    if (!response.ok) {
-      throw unavailable(`东方财富返回 ${response.status}`);
-    }
+  const payload: unknown = await response.json();
+  if (!isJsonObject(payload)) throw unavailable("东方财富响应格式错误");
 
-    const payload: unknown = await response.json();
-    if (!isJsonObject(payload)) throw unavailable("东方财富响应格式错误");
+  const data = payload.data;
+  if (!isJsonObject(data)) throw dataNotAvailable();
 
-    const data = payload.data;
-    if (!isJsonObject(data)) throw dataNotAvailable();
-
-    return data;
-  } catch (error) {
-    if (error instanceof ExternalServiceError) throw error;
-    throw unavailable("东方财富服务暂不可用");
-  }
+  return data;
 }
 
 async function eastMoneyFinancialData(code: string, market: Market): Promise<JsonObject[]> {
@@ -125,12 +150,10 @@ async function eastMoneyFinancialData(code: string, market: Market): Promise<Jso
   const url = `https://datacenter.eastmoney.com/securities/api/data/v1/get?reportName=${reportName}&columns=ALL&filter=(SECURITY_CODE%3D%22${code}%22)&pageNumber=1&pageSize=5&sortTypes=-1&sortColumns=REPORT_DATE`;
 
   try {
-    const response = await fetch(url, {
+    const response = await fetchWithRetry(url, {
       headers: EASTMONEY_HEADERS,
       signal: AbortSignal.timeout(10_000),
-    });
-
-    if (!response.ok) return [];
+    }, "东方财富财务数据服务暂不可用");
 
     const payload: unknown = await response.json();
     if (!isJsonObject(payload)) return [];
@@ -153,12 +176,10 @@ async function eastMoneyIncomeStatement(code: string, market: Market): Promise<J
   const url = `https://datacenter.eastmoney.com/securities/api/data/v1/get?reportName=RPT_DMSK_FN_INCOME&columns=ALL&filter=(SECURITY_CODE%3D%22${code}%22)&pageNumber=1&pageSize=5&sortTypes=-1&sortColumns=REPORT_DATE`;
 
   try {
-    const response = await fetch(url, {
+    const response = await fetchWithRetry(url, {
       headers: EASTMONEY_HEADERS,
       signal: AbortSignal.timeout(10_000),
-    });
-
-    if (!response.ok) return [];
+    }, "东方财富利润表服务暂不可用");
 
     const payload: unknown = await response.json();
     if (!isJsonObject(payload)) return [];
