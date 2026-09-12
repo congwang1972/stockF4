@@ -97,19 +97,11 @@ async function fetchWithRetry(
     : unavailable(errorMessage);
 }
 
-function toEastMoneySecId(ticker: string, market: Market): string {
+function toTencentSymbol(ticker: string, market: Market): string {
   const clean = ticker.replace(/\.(SH|SZ|SS|HK)$/i, "");
-
-  if (market === "US") {
-    return `105.${clean}`;
-  }
-  if (market === "HK") {
-    return `116.${clean.padStart(5, "0")}`;
-  }
-  if (market === "CN") {
-    return clean.startsWith("6") ? `1.${clean}` : `0.${clean}`;
-  }
-  return `1.${clean}`;
+  if (market === "US") return `us${clean}`;
+  if (market === "HK") return `hk${clean.padStart(5, "0")}`;
+  return clean.startsWith("6") ? `sh${clean}` : `sz${clean}`;
 }
 
 function toEastMoneyCode(ticker: string, market: Market): string {
@@ -119,44 +111,66 @@ function toEastMoneyCode(ticker: string, market: Market): string {
   return clean;
 }
 
-const EASTMONEY_HEADERS = {
+const COMMON_HEADERS = {
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  "Accept": "application/json, text/plain, */*",
-  "Referer": "https://quote.eastmoney.com/",
+  "Accept": "*/*",
 };
 
-async function eastMoneyStockGet(secid: string): Promise<JsonObject> {
-  const fields = "f43,f44,f45,f46,f47,f48,f50,f57,f58,f84,f85,f116,f117,f162,f167,f168,f169,f170,f171,f172,f173,f183,f184,f185,f186,f187,f188,f189,f190,f191,f192";
-  const url = `https://push2.eastmoney.com/api/qt/stock/get?secid=${secid}&fields=${fields}&fltt=2&invt=2`;
+interface TencentQuoteData {
+  name: string | null;
+  price: number | null;
+  peRatio: number | null;
+  totalMarketCap: number | null;
+}
 
-  const response = await fetchWithRetry(url, {
-    headers: EASTMONEY_HEADERS,
-    signal: AbortSignal.timeout(10_000),
-  }, "东方财富行情服务暂不可用");
+function parseTencentQuote(text: string, market: Market): TencentQuoteData {
+  const match = text.match(/="([^"]*)"/);
+  if (match === null || match[1] === undefined) return { name: null, price: null, peRatio: null, totalMarketCap: null };
+  const value = match[1];
+  if (value.length === 0) return { name: null, price: null, peRatio: null, totalMarketCap: null };
 
-  const payload: unknown = await response.json();
-  if (!isJsonObject(payload)) throw unavailable("东方财富响应格式错误");
+  const parts = value.split("~");
+  const name = parts[1] !== undefined && parts[1].trim().length > 0 ? parts[1].trim() : null;
+  const price = parts[3] !== undefined ? numberOrNull(parts[3]) : null;
+  const peRatio = parts[39] !== undefined ? numberOrNull(parts[39]) : null;
+  const totalMarketCap = parts[45] !== undefined ? numberOrNull(parts[45]) : null;
 
-  const data = payload.data;
-  if (!isJsonObject(data)) throw dataNotAvailable();
+  return { name, price, peRatio, totalMarketCap };
+}
 
-  return data;
+async function fetchTencentQuote(
+  ticker: string,
+  market: SupportedMarket
+): Promise<{ data: TencentQuoteData; source: string | null }> {
+  const symbol = toTencentSymbol(ticker, market);
+  try {
+    const response = await fetchWithRetry(
+      `https://qt.gtimg.cn/q=${symbol}`,
+      { headers: COMMON_HEADERS, signal: AbortSignal.timeout(5_000) },
+      "腾讯行情服务暂不可用"
+    );
+    const text = await response.text();
+    const data = parseTencentQuote(text, market);
+    return { data, source: "qt.gtimg.cn:quote" };
+  } catch {
+    return { data: { name: null, price: null, peRatio: null, totalMarketCap: null }, source: null };
+  }
 }
 
 async function eastMoneyFinancialData(code: string, market: Market): Promise<JsonObject[]> {
   if (market !== "CN") return [];
 
-  const reportName = "RPT_LICO_FN_CPD";
-  const url = `https://datacenter.eastmoney.com/securities/api/data/v1/get?reportName=${reportName}&columns=ALL&filter=(SECURITY_CODE%3D%22${code}%22)&pageNumber=1&pageSize=5&sortTypes=-1&sortColumns=REPORT_DATE`;
+  const url = `https://datacenter.eastmoney.com/securities/api/data/v1/get?reportName=RPT_LICO_FN_CPD&columns=ALL&filter=(SECURITY_CODE%3D%22${code}%22)&pageNumber=1&pageSize=5&sortTypes=-1&sortColumns=NOTICE_DATE`;
 
   try {
     const response = await fetchWithRetry(url, {
-      headers: EASTMONEY_HEADERS,
+      headers: { ...COMMON_HEADERS, Referer: "https://data.eastmoney.com/" },
       signal: AbortSignal.timeout(10_000),
-    }, "东方财富财务数据服务暂不可用");
+    }, "东方财富数据中心暂不可用");
 
     const payload: unknown = await response.json();
     if (!isJsonObject(payload)) return [];
+    if (payload.success !== true) return [];
 
     const result = payload.result;
     if (!isJsonObject(result)) return [];
@@ -173,16 +187,17 @@ async function eastMoneyFinancialData(code: string, market: Market): Promise<Jso
 async function eastMoneyIncomeStatement(code: string, market: Market): Promise<JsonObject[]> {
   if (market !== "CN") return [];
 
-  const url = `https://datacenter.eastmoney.com/securities/api/data/v1/get?reportName=RPT_DMSK_FN_INCOME&columns=ALL&filter=(SECURITY_CODE%3D%22${code}%22)&pageNumber=1&pageSize=5&sortTypes=-1&sortColumns=REPORT_DATE`;
+  const url = `https://datacenter.eastmoney.com/securities/api/data/v1/get?reportName=RPT_DMSK_FN_INCOME&columns=ALL&filter=(SECURITY_CODE%3D%22${code}%22)&pageNumber=1&pageSize=5&sortTypes=-1&sortColumns=NOTICE_DATE`;
 
   try {
     const response = await fetchWithRetry(url, {
-      headers: EASTMONEY_HEADERS,
+      headers: { ...COMMON_HEADERS, Referer: "https://data.eastmoney.com/" },
       signal: AbortSignal.timeout(10_000),
     }, "东方财富利润表服务暂不可用");
 
     const payload: unknown = await response.json();
     if (!isJsonObject(payload)) return [];
+    if (payload.success !== true) return [];
 
     const result = payload.result;
     if (!isJsonObject(result)) return [];
@@ -196,20 +211,22 @@ async function eastMoneyIncomeStatement(code: string, market: Market): Promise<J
   }
 }
 
-function buildMetricsFromEastMoney(
-  stockData: JsonObject,
+function buildMetrics(
+  tencentData: TencentQuoteData,
   financialData: JsonObject[],
   incomeData: JsonObject[]
 ): FinancialMetrics {
-  const peRatio = numberOrNull(stockData.f162);
-  const roe = numberOrNull(stockData.f167);
-  const profitMargin = numberOrNull(stockData.f186);
-
   const revenueGrowth: number[] = [];
   const netIncome: number[] = [];
   const freeCashFlow: number[] = [];
 
   const sortedIncome = [...incomeData].sort((a, b) => {
+    const dateA = stringOrNull(a.REPORT_DATE) ?? "";
+    const dateB = stringOrNull(b.REPORT_DATE) ?? "";
+    return dateA.localeCompare(dateB);
+  });
+
+  const sortedFinancial = [...financialData].sort((a, b) => {
     const dateA = stringOrNull(a.REPORT_DATE) ?? "";
     const dateB = stringOrNull(b.REPORT_DATE) ?? "";
     return dateA.localeCompare(dateB);
@@ -223,7 +240,7 @@ function buildMetricsFromEastMoney(
     if (net !== null) netIncome.push(net);
   }
 
-  for (let i = 1; i < revenues.length; i++) {
+  for (let i = 1; i < revenues.length; i += 1) {
     const current = revenues[i];
     const previous = revenues[i - 1];
     if (current !== null && previous !== null && previous !== 0) {
@@ -239,77 +256,78 @@ function buildMetricsFromEastMoney(
     }
   }
 
-  const totalAssets = numberOrNull(stockData.f183);
-  const totalLiabilities = numberOrNull(stockData.f184);
-  const debtLevel = totalAssets !== null && totalLiabilities !== null && totalAssets !== 0
-    ? totalLiabilities / totalAssets
-    : null;
+  let profitMargin: number | null = null;
+  let roe: number | null = null;
+  let debtLevel: number | null = null;
+
+  const latestFinancial = sortedFinancial[sortedFinancial.length - 1];
+  if (latestFinancial !== undefined) {
+    const netProfitMargin = numberOrNull(latestFinancial.NETPROFIT_MARGIN);
+    if (netProfitMargin !== null) profitMargin = netProfitMargin / 100;
+
+    const roeValue = numberOrNull(latestFinancial.ROE_WEIGHT);
+    if (roeValue !== null) roe = roeValue / 100;
+
+    const totalAssets = numberOrNull(latestFinancial.TOTAL_ASSETS);
+    const totalLiabilities = numberOrNull(latestFinancial.TOTAL_LIABILITIES);
+    if (totalAssets !== null && totalLiabilities !== null && totalAssets !== 0) {
+      debtLevel = totalLiabilities / totalAssets;
+    }
+  }
 
   return {
     revenueGrowth,
     netIncome,
     freeCashFlow,
-    profitMargin: profitMargin !== null ? profitMargin / 100 : null,
+    profitMargin,
     debtLevel,
-    roe: roe !== null ? roe / 100 : null,
-    peRatio,
+    roe,
+    peRatio: tencentData.peRatio,
     industryAvgPe: null,
   };
 }
 
-function extractProfile(stockData: JsonObject, market: Market): CompanyProfile {
-  const name = stringOrNull(stockData.f58);
-  if (name === null) throw dataNotAvailable();
-
-  let sector: string | null = null;
-  if (market === "CN") {
-    sector = stringOrNull(stockData.f127);
-  }
-
-  return {
-    name,
-    sector,
-    description: null,
-  };
-}
-
-function extractQuote(stockData: JsonObject, market: Market): StockQuote | null {
-  const price = numberOrNull(stockData.f43);
-  if (price === null) return null;
-
-  const currencyMap: Record<Market, "CNY" | "USD" | "HKD"> = {
-    CN: "CNY",
-    US: "USD",
-    HK: "HKD",
-    UNKNOWN: "CNY",
-  };
-
-  return {
-    price,
-    currency: currencyMap[market],
-    updatedAt: new Date().toISOString(),
-  };
-}
-
-async function fetchFinancialDataFromEastMoney(
+async function fetchFinancialDataCombined(
   ticker: string,
   market: SupportedMarket
 ): Promise<FinancialData> {
-  const secid = toEastMoneySecId(ticker, market);
   const code = toEastMoneyCode(ticker, market);
 
-  const [stockData, financialData, incomeData] = await Promise.all([
-    eastMoneyStockGet(secid),
+  const [quoteResult, financialData, incomeData] = await Promise.all([
+    fetchTencentQuote(ticker, market),
     eastMoneyFinancialData(code, market),
     eastMoneyIncomeStatement(code, market),
   ]);
 
-  const profile = extractProfile(stockData, market);
-  const metrics = buildMetricsFromEastMoney(stockData, financialData, incomeData);
-  const quote = extractQuote(stockData, market);
+  const companyName = quoteResult.data.name;
+  if (companyName === null) throw dataNotAvailable();
 
-  const sources = ["eastmoney:stock"];
-  if (incomeData.length > 0) sources.push("eastmoney:financials");
+  const profile: CompanyProfile = {
+    name: companyName,
+    sector: null,
+    description: null,
+  };
+
+  const metrics = buildMetrics(quoteResult.data, financialData, incomeData);
+
+  let quote: StockQuote | null = null;
+  if (quoteResult.data.price !== null) {
+    const currencyMap: Record<SupportedMarket, "CNY" | "USD" | "HKD"> = {
+      CN: "CNY",
+      US: "USD",
+      HK: "HKD",
+    };
+    quote = {
+      price: quoteResult.data.price,
+      currency: currencyMap[market],
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  const sources: string[] = [];
+  if (quoteResult.source !== null) sources.push(quoteResult.source);
+  if (financialData.length > 0) sources.push("eastmoney:financials");
+  if (incomeData.length > 0) sources.push("eastmoney:income");
 
   return { profile, metrics, quote, sources };
 }
@@ -318,7 +336,7 @@ export async function fetchFinancialData(
   ticker: string,
   market: Exclude<Market, "UNKNOWN">
 ): Promise<FinancialData> {
-  return fetchFinancialDataFromEastMoney(ticker, market);
+  return fetchFinancialDataCombined(ticker, market);
 }
 
 function supportedMarket(market: Market): SupportedMarket {
