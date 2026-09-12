@@ -69,6 +69,31 @@ function extractReportContent(payload: unknown): ReportContent {
   return result.data;
 }
 
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 2_000;
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => { setTimeout(resolve, ms); });
+}
+
+async function fetchWithRetry(
+  url: string,
+  init: RequestInit
+): Promise<Response> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt += 1) {
+    try {
+      const response = await fetch(url, init);
+      if (response.ok || response.status < 500) return response;
+      lastError = new Error(`HTTP ${response.status}`);
+    } catch (error) {
+      lastError = error;
+    }
+    if (attempt < MAX_RETRIES - 1) await delay(RETRY_DELAY_MS);
+  }
+  throw lastError;
+}
+
 export async function generateReportContent(input: ReportGenerationInput): Promise<ReportContent> {
   const apiKey = nonEmptyEnvironmentValue(process.env.DASHSCOPE_API_KEY);
   const baseUrl = nonEmptyEnvironmentValue(process.env.DASHSCOPE_BASE_URL);
@@ -79,7 +104,7 @@ export async function generateReportContent(input: ReportGenerationInput): Promi
 
   let response: Response;
   try {
-    response = await fetch(`${baseUrl.replace(/\/+$/, "")}/chat/completions`, {
+    response = await fetchWithRetry(`${baseUrl.replace(/\/+$/, "")}/chat/completions`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
